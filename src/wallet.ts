@@ -1,6 +1,6 @@
 import type FreighterApi from '@stellar/freighter-api';
 
-import { FreighterInstallCheckError, SignTransactionTimeoutError } from './errors';
+import { FreighterInstallCheckError, SignTransactionTimeoutError, WalletNetworkMismatchError } from './errors';
 
 /**
  * `@stellar/freighter-api` is an optional peer dependency — consumers who
@@ -119,7 +119,40 @@ export interface WalletAdapter {
   getNetwork?(): Promise<{ network: string; networkPassphrase: string }>;
 }
 
+/**
+ * Options accepted by {@link FreighterWalletAdapter}.
+ *
+ * `expectedNetworkPassphrase` is the network the SDK/client is configured for.
+ * When provided, the adapter verifies the wallet's current network against it
+ * on `connect()`/`reconnect()` and rejects with a
+ * {@link WalletNetworkMismatchError} on mismatch — instead of letting a
+ * testnet wallet silently sign for a mainnet-configured client.
+ */
+export interface FreighterWalletAdapterOptions {
+  expectedNetworkPassphrase?: string;
+}
+
 export class FreighterWalletAdapter implements WalletAdapter {
+  private readonly expectedNetworkPassphrase?: string;
+
+  constructor(options: FreighterWalletAdapterOptions = {}) {
+    this.expectedNetworkPassphrase = options.expectedNetworkPassphrase;
+  }
+
+  /**
+   * Rejects with a {@link WalletNetworkMismatchError} when the wallet's
+   * reported network passphrase does not match the configured one. No-op when
+   * no expected passphrase was configured or the wallet reports none.
+   */
+  private assertNetworkMatches(networkPassphrase: string): void {
+    if (!this.expectedNetworkPassphrase || !networkPassphrase) {
+      return;
+    }
+    if (networkPassphrase !== this.expectedNetworkPassphrase) {
+      throw new WalletNetworkMismatchError(this.expectedNetworkPassphrase, networkPassphrase);
+    }
+  }
+
   /**
    * Reports whether the Freighter extension is present and reachable.
    *
@@ -153,10 +186,13 @@ export class FreighterWalletAdapter implements WalletAdapter {
       throw new Error(networkDetails.error.message);
     }
 
+    const networkPassphrase = networkDetails?.networkPassphrase ?? '';
+    this.assertNetworkMatches(networkPassphrase);
+
     return {
       publicKey: access.address,
       network: networkDetails?.network ?? '',
-      networkPassphrase: networkDetails?.networkPassphrase ?? '',
+      networkPassphrase,
     };
   }
 
@@ -168,10 +204,13 @@ export class FreighterWalletAdapter implements WalletAdapter {
       throw new Error(networkDetails.error.message);
     }
 
+    const networkPassphrase = networkDetails?.networkPassphrase ?? '';
+    this.assertNetworkMatches(networkPassphrase);
+
     return {
       publicKey,
       network: networkDetails?.network ?? '',
-      networkPassphrase: networkDetails?.networkPassphrase ?? '',
+      networkPassphrase,
     };
   }
 
@@ -215,84 +254,6 @@ export class FreighterWalletAdapter implements WalletAdapter {
     const freighterApiPromise = loadFreighterApi();
 
     // Race the Freighter call against a timer so that a hung or dismissed
-    // popup never leaves the caller's promise pending indefinitely (#154).
-    let timeoutHandle: ReturnType<typeof setTimeout>;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(
-        () => reject(new SignTransactionTimeoutError(timeoutMs)),
-        timeoutMs,
-      );
-    });
+    // popup never leaves the caller's promise pending
 
-    try {
-      const { signedTxXdr, error } = await Promise.race([
-        freighterApiPromise.then((freighterApi) =>
-          freighterApi.signTransaction(transactionXdr, {
-            networkPassphrase: opts.networkPassphrase,
-          }),
-        ),
-        timeoutPromise,
-      ]);
-      if (error) {
-        throw new Error(error.message);
-      }
-      return signedTxXdr;
-    } finally {
-      clearTimeout(timeoutHandle!);
-    }
-  }
-}
-
-const defaultFreighterWalletAdapter = new FreighterWalletAdapter();
-
-/**
- * Checks whether the Freighter browser extension is installed. This does not
- * require the current site to be connected/allowed — it only checks for the
- * extension's presence.
- *
- * @throws {FreighterInstallCheckError} if the underlying check fails for a
- * reason other than the extension being absent (e.g. running outside a
- * browser, or an internal Freighter error). Callers that only want a
- * best-effort "should I show an install prompt?" signal can treat a caught
- * {@link FreighterInstallCheckError} as "unknown" rather than "not installed".
- */
-export async function isFreighterInstalled(): Promise<boolean> {
-  return await defaultFreighterWalletAdapter.isConnected();
-}
-
-/** Connects to the Freighter wallet and returns the connection details. */
-export async function connectWallet(): Promise<WalletConnection> {
-  return await defaultFreighterWalletAdapter.connect();
-}
-
-/** Returns the public key of the currently connected Freighter account. */
-export async function getPublicKey(): Promise<string> {
-  return await defaultFreighterWalletAdapter.getPublicKey();
-}
-
-/** Signs a transaction XDR using the connected Freighter wallet. */
-export async function signTransaction(
-  transactionXdr: string,
-  opts: { networkPassphrase: string; timeoutMs?: number },
-): Promise<string> {
-  return await defaultFreighterWalletAdapter.signTransaction(transactionXdr, opts);
-}
-
-/** Returns the default Freighter-based wallet adapter instance. */
-export function getDefaultWalletAdapter(): WalletAdapter {
-  return defaultFreighterWalletAdapter;
-}
-
-/**
- * The default {@link WalletAdapter}, backed by the Freighter browser
- * extension. This is what {@link SoroWillClient} uses when no `wallet` option
- * is supplied, so existing Freighter-based usage keeps working unchanged.
- */
-export const freighterAdapter: WalletAdapter = {
-  isConnected: () => defaultFreighterWalletAdapter.isConnected(),
-  connect: () => defaultFreighterWalletAdapter.connect(),
-  reconnect: () => defaultFreighterWalletAdapter.reconnect(),
-  disconnect: () => defaultFreighterWalletAdapter.disconnect(),
-  getPublicKey,
-  signTransaction,
-};
+/* … truncated 2924 chars — edit only what you need near the top … */
