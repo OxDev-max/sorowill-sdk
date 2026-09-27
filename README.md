@@ -755,3 +755,6 @@ This repo participates in the **Stellar Wave Program** on [Drips](https://drips.
 
 <!-- handsoff-issue-432 -->
 - #432: Recovery from simulation errors does not provide the error details from the contract, just a generic SimulationError, leaving clients unable to debug failed operations
+
+<!-- handsoff-issue-435 -->
+- #435: Pagination cursor is a plain string with no validation, so a user-provided cursor from an external source could cause injection attacks or iteration beyond the stored data
