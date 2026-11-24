@@ -1726,6 +1726,43 @@ export class SoroWillClient {
   }
 
   /**
+   * Adds funds to an existing will without replacing its configuration.
+   *
+   * Supports incremental partial top-ups: each call transfers exactly
+   * `amount` (in stroops) from the connected wallet to the will's token
+   * balance and returns the resulting balance.
+   *
+   * @param willId - The will to fund.
+   * @param amount - Amount to add, in stroops. Must be greater than zero.
+   * @param options - Optional request options (timeouts, retries, hooks).
+   * @returns The transaction hash, the funded amount and the new will balance.
+   * @throws {SoroWillError} If the transaction simulation/submission fails.
+   * @throws {WillNotFoundError} If the will does not exist.
+   */
+  async fundWill(
+    willId: string,
+    amount: bigint | number | string,
+    options?: RequestOptions,
+  ): Promise<{ txHash: string; amount: bigint; newBalance: bigint }> {
+    const normalizedWillId = validateWillId(willId);
+    const fundAmount = validateAmount(amount);
+    await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
+    const funder = await this.getWalletPublicKey();
+    const { txHash } = await this.invoke(
+      'fund_will',
+      {
+        funder,
+        will_id: normalizedWillId,
+        amount: fundAmount,
+      },
+      options,
+    );
+    const will = await this.getWill(normalizedWillId, options);
+    const newBalance = BigInt(will.amount);
+    return { txHash, amount: fundAmount, newBalance };
+  }
+
+  /**
    * Resets the check-in countdown for `willId`.
    *
    * Before submitting, the will's existence is validated via `getWill()`
