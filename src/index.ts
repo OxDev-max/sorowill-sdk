@@ -17,6 +17,7 @@ export {
 export { MAX_CHECKIN_PERIOD_DAYS } from './SoroWillClient';
 export type {
   ContractStorageDurability,
+  MinimumWillBalance,
   EventSubscription,
   EventSubscriptionOptions,
   EventSubscriptionTransport,

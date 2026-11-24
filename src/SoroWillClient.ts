@@ -1083,6 +1083,92 @@ function validateContractIdFormat(contractId: unknown): asserts contractId is st
 /** How long {@link SoroWillClient.willStatus} may serve a cached status (#726). */
 const WILL_STATUS_CACHE_TTL_MS = 30_000;
 
+/**
+ * How long {@link SoroWillClient.getMinimumWillBalance} may serve a cached
+ * result before re-querying the contract (#802).
+ */
+const MINIMUM_WILL_BALANCE_CACHE_TTL_MS = 60_000;
+
+/** Stroops per lumen (XLM). */
+const STROOPS_PER_LUMEN = 10_000_000n;
+
+/**
+ * Minimum balance requirement for creating and maintaining a will, returned by
+ * {@link SoroWillClient.getMinimumWillBalance} (#802).
+ */
+export interface MinimumWillBalance {
+  /** Minimum will balance in stroops (base-10 string). */
+  stroops: string;
+  /** Minimum will balance in lumens (XLM), as a decimal string. */
+  lumens: string;
+  /**
+   * Estimated fee requirement in stroops (base-10 string): the network base
+   * fee plus the simulated resource fee for a `create_will` invocation.
+   */
+  feeStroops: string;
+  /** Estimated fee requirement in lumens (XLM), as a decimal string. */
+  feeLumens: string;
+  /**
+   * Total amount in stroops (base-10 string) a new will needs to be funded
+   * with: `stroops + feeStroops`.
+   */
+  totalStroops: string;
+  /** Total amount in lumens (XLM), as a decimal string. */
+  totalLumens: string;
+  /** Wall-clock timestamp (ms) when this result was computed. */
+  fetchedAt: number;
+}
+
+/** Formats a stroop amount as a decimal lumen string without precision loss. */
+function stroopsToLumens(stroops: bigint): string {
+  const negative = stroops < 0n;
+  const abs = negative ? -stroops : stroops;
+  const whole = abs / STROOPS_PER_LUMEN;
+  const fraction = (abs % STROOPS_PER_LUMEN).toString().padStart(7, '0').replace(/0+$/, '');
+  const body = fraction.length > 0 ? `${whole}.${fraction}` : whole.toString();
+  return negative ? `-${body}` : body;
+}
+
+/**
+ * True when `error` indicates the deployed contract spec has no such method,
+ * so a fallback method name may be tried.
+ */
+function isUnknownContractMethodError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return /unknown (?:contract )?(?:method|function)|method not found|no such method|missing method/i.test(
+    text,
+  );
+}
+
+/**
+ * Normalizes the contract's minimum-balance response, which may be a plain
+ * integer (stroops) or a struct with a `min_balance`/`minimum_balance` field.
+ */
+function parseMinimumBalance(raw: unknown): bigint {
+  if (typeof raw === 'bigint') {
+    return raw;
+  }
+  if (typeof raw === 'number' && Number.isSafeInteger(raw)) {
+    return BigInt(raw);
+  }
+  if (typeof raw === 'string' && /^\d+$/.test(raw)) {
+    return BigInt(raw);
+  }
+  if (typeof raw === 'object' && raw !== null) {
+    const record = raw as Record<string, unknown>;
+    for (const key of ['min_balance', 'minimum_balance', 'minBalance', 'minimumBalance']) {
+      const value = record[key];
+      if (typeof value === 'bigint') return value;
+      if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value);
+      if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+    }
+  }
+  throw new SoroWillError(
+    'SoroWill received an unexpected shape while decoding the minimum will balance from the contract response. ' +
+      'This usually means the deployed contract spec and this SDK version have drifted apart.',
+  );
+}
+
 /** Maximum number of items accepted by the batch helpers (#727). */
 const MAX_BATCH_OPERATIONS = 25;
 
@@ -1133,6 +1219,8 @@ export class SoroWillClient {
   private readonly deduplicateReads: boolean;
   /** Per-will status cache backing {@link SoroWillClient.willStatus} (#726). */
   private readonly statusCache = new Map<string, { status: WillStatus; expiresAt: number }>();
+  /** Cached minimum will balance result backing {@link SoroWillClient.getMinimumWillBalance} (#802). */
+  private minimumWillBalanceCache: { value: MinimumWillBalance; expiresAt: number } | undefined;
   /**
    * Read simulations currently in flight, keyed by method + arguments +
    * request options, so identical concurrent reads share one RPC call (#619).
@@ -2431,6 +2519,93 @@ export class SoroWillClient {
     const { status } = mapWill(raw);
     this.statusCache.set(canonicalWillId, { status, expiresAt: now + WILL_STATUS_CACHE_TTL_MS });
     return status;
+  }
+
+  /**
+   * Queries the minimum balance a will must hold, as required by the deployed
+   * contract, and returns it in stroops and lumens together with the estimated
+   * fee requirement for creating a will (#802).
+   *
+   * **Operation Type:** Read-only (Query)
+   *
+   * The contract is queried via its `get_min_balance` method (falling back to
+   * `get_minimum_balance` when the deployed spec only exposes that name). The
+   * fee requirement is the network base fee plus the simulated resource fee of
+   * a `create_will` invocation, so `totalStroops` is the amount a new will
+   * should be funded with to cover both the minimum balance and its fee.
+   *
+   * Results are cached in memory for 60 seconds. Pass `skipCache: true` to
+   * force a fresh query.
+   *
+   * @param options - Optional per-call timeout, abort signal and cache bypass.
+   * @returns The minimum will balance and fee requirement in stroops and lumens.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   *
+   * @example
+   * ```ts
+   * const { stroops, lumens, totalStroops } = await client.getMinimumWillBalance();
+   * console.log(`Fund a new will with at least ${totalStroops} stroops (${lumens} XLM minimum)`);
+   * ```
+   */
+  async getMinimumWillBalance(options?: RequestOptions): Promise<MinimumWillBalance> {
+    const now = Date.now();
+    if (!options?.skipCache && this.minimumWillBalanceCache && this.minimumWillBalanceCache.expiresAt > now) {
+      return this.minimumWillBalanceCache.value;
+    }
+
+    const raw = await this.readMinimumBalance(options);
+    const stroops = parseMinimumBalance(raw);
+
+    let feeStroops = BigInt(BASE_FEE);
+    try {
+      const { totalFee } = await this.previewFee('create_will', {}, options);
+      feeStroops = BigInt(totalFee);
+    } catch {
+      // Fee simulation is best-effort: fall back to the network base fee so the
+      // minimum balance is still returned when simulation is unavailable.
+    }
+
+    const value: MinimumWillBalance = {
+      stroops: stroops.toString(),
+      lumens: stroopsToLumens(stroops),
+      feeStroops: feeStroops.toString(),
+      feeLumens: stroopsToLumens(feeStroops),
+      totalStroops: (stroops + feeStroops).toString(),
+      totalLumens: stroopsToLumens(stroops + feeStroops),
+      fetchedAt: now,
+    };
+    this.minimumWillBalanceCache = {
+      value,
+      expiresAt: now + MINIMUM_WILL_BALANCE_CACHE_TTL_MS,
+    };
+    return value;
+  }
+
+  /** Reads the contract's minimum will balance, tolerating either method name. */
+  private async readMinimumBalance(options?: RequestOptions): Promise<unknown> {
+    try {
+      return await this.read<unknown>('get_min_balance', {}, options);
+    } catch (error) {
+      if (!isUnknownContractMethodError(error)) {
+        throw error;
+      }
+      return this.read<unknown>('get_minimum_balance', {}, options);
+    }
+  }
+
+  /**
+   * Clears the cached minimum will balance so the next
+   * {@link SoroWillClient.getMinimumWillBalance} call re-queries the contract.
+   *
+   * **Operation Type:** Read-only (Cache Invalidation)
+   *
+   * @example
+   * ```ts
+   * client.flushMinimumWillBalanceCache();
+   * ```
+   */
+  flushMinimumWillBalanceCache(): void {
+    this.minimumWillBalanceCache = undefined;
   }
 
   /**
