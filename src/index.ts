@@ -298,9 +298,14 @@ export {
   classifyRpcError,
   isRateLimitError,
   MAX_BACKOFF_MS,
+  DEFAULT_JITTER_RANGE,
   ErrorTransience,
 } from './requestQueue';
-export type { RequestQueueMetrics, RequestQueueOptions } from './requestQueue';
+export type {
+  BackoffJitterRange,
+  RequestQueueMetrics,
+  RequestQueueOptions,
+} from './requestQueue';
 
 export { DebugLogger, DEFAULT_REDACTED_KEYS, REDACTED } from './debugLogger';
 export type { DebugLoggerOptions } from './debugLogger';

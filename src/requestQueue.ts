@@ -48,11 +48,20 @@ export interface RequestQueueOptions {
   maxRateLimitRetries?: number;
   /**
    * Base delay in milliseconds for rate-limit retries. The n-th retry waits
-   * `2^n * retryBaseDelayMs` (capped by {@link maxBackoffMs}). Defaults to 500.
+   * `2^n * retryBaseDelayMs` (capped by {@link maxBackoffMs}), then scaled by
+   * the configured {@link jitter} range. Defaults to 500.
    */
   retryBaseDelayMs?: number;
   /** Upper bound in milliseconds for a single backoff delay. Defaults to 60 000 (60s). */
   maxBackoffMs?: number;
+  /**
+   * Random jitter applied to retry backoff delays to avoid thundering herds
+   * (#801). Either a boolean (`true` = default 0.5–1.0 range) or an explicit
+   * `{ min, max }` fraction range where `0 <= min <= max <= 1`. The delay is
+   * multiplied by a random factor in `[min, max]`. Defaults to `true`.
+   * Set to `false` for deterministic exponential backoff.
+   */
+  jitter?: boolean | BackoffJitterRange;
   /**
    * Default timeout in milliseconds for requests that do not specify an
    * explicit `timeoutMs` in {@link RequestQueue.enqueue}. Prevents stuck
@@ -90,22 +99,41 @@ export interface RequestQueueMetrics {
 export const MAX_BACKOFF_MS = 60_000;
 
 /**
+ * Fractional jitter range applied to a backoff delay. The delay is multiplied
+ * by a uniformly random factor in `[min, max]`, where `0 <= min <= max <= 1`.
+ */
+export interface BackoffJitterRange {
+  min: number;
+  max: number;
+}
+
+/** Default jitter range: 50%–100% of the computed exponential delay. */
+export const DEFAULT_JITTER_RANGE: BackoffJitterRange = { min: 0.5, max: 1 };
+
+/**
  * Computes the exponential backoff delay for a retry: `2^attempt * baseDelayMs`,
  * capped at `maxBackoffMs`. `attempt` is zero-based (the first retry is attempt 0).
- * When `jitter` is `true`, applies 50%–100% jitter to prevent retry storms.
+ *
+ * When `jitter` is `true` (or a {@link BackoffJitterRange}), the capped delay is
+ * multiplied by a uniformly random factor in the jitter range to spread retries
+ * and avoid thundering herds (#801). `true` uses {@link DEFAULT_JITTER_RANGE}.
  */
 export function computeBackoffDelay(
   attempt: number,
   baseDelayMs: number,
   maxBackoffMs: number = MAX_BACKOFF_MS,
-  jitter: boolean = false,
+  jitter: boolean | BackoffJitterRange = false,
 ): number {
   const delay = 2 ** attempt * baseDelayMs;
   const capped = Number.isFinite(delay) ? Math.min(delay, maxBackoffMs) : maxBackoffMs;
-  if (!jitter) {
+  if (jitter === false) {
     return capped;
   }
-  return Math.floor(capped * (0.5 + Math.random() * 0.5));
+  const range = jitter === true ? DEFAULT_JITTER_RANGE : jitter;
+  const min = Math.min(Math.max(range.min, 0), 1);
+  const max = Math.min(Math.max(range.max, min), 1);
+  const factor = min + Math.random() * (max - min);
+  return Math.floor(capped * factor);
 }
 
 /**
@@ -341,6 +369,7 @@ class QueueCore {
   readonly maxRateLimitRetries: number;
   readonly retryBaseDelayMs: number;
   readonly maxBackoffMs: number;
+  readonly jitter: boolean | BackoffJitterRange;
   readonly defaultTimeoutMs: number;
   readonly batchSize: number;
   readonly backupThreshold: number;
@@ -361,6 +390,7 @@ class QueueCore {
     maxRateLimitRetries: number,
     retryBaseDelayMs: number,
     maxBackoffMs: number,
+    jitter: boolean | BackoffJitterRange,
     defaultTimeoutMs: number,
     batchSize: number,
     backupThreshold: number,
@@ -372,6 +402,7 @@ class QueueCore {
     this.maxRateLimitRetries = maxRateLimitRetries;
     this.retryBaseDelayMs = retryBaseDelayMs;
     this.maxBackoffMs = maxBackoffMs;
+    this.jitter = jitter;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.batchSize = batchSize;
     this.backupThreshold = backupThreshold;
@@ -415,6 +446,22 @@ export class RequestQueue {
         throw new RangeError(`maxBackoffMs must be at most ${MAX_BACKOFF_MS}ms, received ${options.maxBackoffMs}`);
       }
     }
+    if (options.jitter !== undefined && typeof options.jitter !== 'boolean') {
+      const { min, max } = options.jitter;
+      if (
+        typeof min !== 'number' ||
+        typeof max !== 'number' ||
+        !Number.isFinite(min) ||
+        !Number.isFinite(max) ||
+        min < 0 ||
+        max > 1 ||
+        min > max
+      ) {
+        throw new RangeError(
+          `jitter range must satisfy 0 <= min <= max <= 1, received { min: ${min}, max: ${max} }`,
+        );
+      }
+    }
 
     const maxConcurrent = options.maxConcurrent ?? 4;
     const requestsPerSecond = options.requestsPerSecond ?? 10;
@@ -422,6 +469,7 @@ export class RequestQueue {
     const maxRateLimitRetries = options.maxRateLimitRetries ?? 3;
     const retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
     const maxBackoffMs = options.maxBackoffMs ?? MAX_BACKOFF_MS;
+    const jitter = options.jitter ?? true;
     const defaultTimeoutMs = options.defaultTimeoutMs ?? 30_000;
     const batchSize = options.batchSize ?? 10;
     const backupThreshold = options.backupThreshold ?? 50;
@@ -437,6 +485,7 @@ export class RequestQueue {
           maxRateLimitRetries,
           retryBaseDelayMs,
           maxBackoffMs,
+          jitter,
           defaultTimeoutMs,
           batchSize,
           backupThreshold,
@@ -454,6 +503,7 @@ export class RequestQueue {
         maxRateLimitRetries,
         retryBaseDelayMs,
         maxBackoffMs,
+        jitter,
         defaultTimeoutMs,
         batchSize,
         backupThreshold,
@@ -748,7 +798,12 @@ export class RequestQueue {
       } catch (error) {
         // Retry rate-limit errors with exponential backoff
         if (isRateLimitError(error) && attemptNumber < this.core.maxRateLimitRetries) {
-          const delay = computeBackoffDelay(attemptNumber, this.core.retryBaseDelayMs, this.core.maxBackoffMs);
+          const delay = computeBackoffDelay(
+            attemptNumber,
+            this.core.retryBaseDelayMs,
+            this.core.maxBackoffMs,
+            this.core.jitter,
+          );
           await new Promise((resolve) => setTimeout(resolve, delay));
           return executeWithRetry(attemptNumber + 1);
         }
