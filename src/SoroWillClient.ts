@@ -2843,6 +2843,87 @@ export class SoroWillClient {
   }
 
   /**
+   * Lists every will `guardian` is named as a guardian on. Does not require a
+   * connected wallet.
+   *
+   * **Immutability guarantee:** The returned `Will[]` array and each element
+   * are fresh clones. Mutating the array or any `Will` property does **not**
+   * affect internal SDK state or the read cache. When
+   * {@link SoroWillClientOptions.deepFreeze} is `true`, each returned object
+   * is deep-frozen so any mutation attempt throws a `TypeError`.
+   *
+   * @param guardian - The Stellar public key of the guardian.
+   * @param options - Optional pagination and per-call timeout/abort signal.
+   * @returns An array of will records naming `guardian`.
+   * @throws {InvalidCursorError} If a pagination cursor is invalid.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   */
+  async getWillsByGuardian(
+    guardian: string,
+    options?: RequestOptions,
+  ): Promise<Will[]>;
+  /**
+   * Lists every will `guardian` is named as a guardian on, one client-side
+   * page at a time. Does not require a connected wallet.
+   *
+   * **Immutability guarantee:** Same as {@link getWillsByGuardian} — returned
+   * objects are clones (deep-frozen when `deepFreeze` is enabled).
+   *
+   * **Read-only operation** — does not require wallet authentication.
+   *
+   * @param guardian - The Stellar public key of the guardian.
+   * @param options - Pagination options plus optional timeout/abort signal.
+   * @returns A paginated page of will records.
+   *
+   * @example
+   * ```ts
+   * const wills = await client.getWillsByGuardian('GISSUE559...');
+   * ```
+   */
+  async getWillsByGuardian(
+    guardian: string,
+    options: PaginationOptions & RequestOptions,
+  ): Promise<PaginatedWillsResult>;
+  async getWillsByGuardian(
+    guardian: string,
+    options?: (PaginationOptions & RequestOptions) | RequestOptions,
+  ): Promise<Will[] | PaginatedWillsResult> {
+    // #612: reject malformed addresses before they reach the cache key or RPC.
+    assertValidStellarAddress(guardian, 'guardian', { allowContract: true });
+    const paginationOptions = options as PaginationOptions | undefined;
+    if (paginationOptions?.cursor !== undefined) {
+      parseCursor(paginationOptions.cursor);
+    }
+    if (paginationOptions?.pageSize !== undefined) {
+      normalizePositiveInteger(paginationOptions.pageSize, 'pageSize');
+    }
+    const cacheKey = createReadCacheKey('get_wills_by_guardian', { guardian });
+    if (this.readCache && !options?.skipCache) {
+      await this.readCache.ready();
+      const cached = this.readCache.get<Will[]>(cacheKey);
+      if (cached !== undefined) {
+        const cloned = cached.map(cloneWill);
+        return this.paginate(
+          this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
+          options,
+        );
+      }
+    }
+    const raw = await this.read<unknown>(
+      'get_wills_by_guardian',
+      { guardian },
+      options,
+    );
+    const wills = mapWillList(raw);
+    this.readCache?.set(cacheKey, wills.map(cloneWill), wills.map((will) => will.id));
+    const cloned = wills.map(cloneWill);
+    return this.paginate(
+      this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
+      options,
+    );
+  }
+
+  /**
    * Applies optional client-side pagination to an already-fetched list of
    * wills. Returns the plain list unchanged when neither `pageSize` nor
    * `cursor` is present on `options`, so callers who don't ask for
