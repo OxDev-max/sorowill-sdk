@@ -84,6 +84,20 @@ export interface RequestQueueOptions {
    * exceeds {@link backupThreshold}.
    */
   onQueueDepthWarning?: (depth: number, maxQueueSize: number) => void;
+  /**
+   * Priority assigned to requests enqueued without an explicit priority.
+   * Defaults to {@link RequestPriority.Normal}. Use this to make a queue
+   * critical (e.g. `RequestPriority.High`) or background-only
+   * (`RequestPriority.Low`) without changing every call site.
+   */
+  defaultPriority?: RequestPriority;
+  /**
+   * Optional custom priority levels. When provided, these replace the built-in
+   * {@link RequestPriority} levels: higher numeric values are processed first.
+   * Requests enqueued with a priority that is not listed here are rejected with
+   * a `RangeError`.
+   */
+  priorities?: readonly number[];
 }
 
 /** Snapshot of {@link RequestQueue} depth and active execution metrics. */
@@ -282,7 +296,6 @@ export function classifyRpcError(error: unknown): ErrorTransience {
   return ErrorTransience.Permanent;
 }
 
-/** Priority level for requests in the queue. Higher priority requests are processed first within FIFO ordering constraints. */
 /**
  * Raised by {@link RequestQueue.enqueueAfter} when a dependency of a queued
  * request rejects, so the dependent request is never executed (#733).
@@ -301,6 +314,11 @@ export class RequestDependencyError extends Error {
   }
 }
 
+/**
+ * Priority level for requests in the queue. Higher priority requests are
+ * processed first; requests with equal priority are processed in FIFO order.
+ * Levels are configurable per queue via {@link RequestQueueOptions.priorities}.
+ */
 export enum RequestPriority {
   /** Low priority for background operations (e.g., UI polling). */
   Low = 0,
@@ -309,6 +327,13 @@ export enum RequestPriority {
   /** High priority for user-initiated operations (e.g., form submissions). */
   High = 2,
 }
+
+/** Built-in priority levels, ordered from lowest to highest. */
+export const DEFAULT_PRIORITIES: readonly RequestPriority[] = [
+  RequestPriority.Low,
+  RequestPriority.Normal,
+  RequestPriority.High,
+];
 
 /** Maximum number of completed request traces kept for debugging. */
 export const MAX_REQUEST_TRACES = 100;
@@ -374,6 +399,8 @@ class QueueCore {
   readonly batchSize: number;
   readonly backupThreshold: number;
   readonly onQueueDepthWarning: ((depth: number, maxQueueSize: number) => void) | undefined;
+  readonly defaultPriority: RequestPriority;
+  readonly priorities: readonly number[];
   readonly pending: Array<PendingRequest<unknown>> = [];
   readonly starts: number[] = [];
   /** Most recent completed request traces, oldest first. */
@@ -395,6 +422,8 @@ class QueueCore {
     batchSize: number,
     backupThreshold: number,
     onQueueDepthWarning?: (depth: number, maxQueueSize: number) => void,
+    defaultPriority: RequestPriority = RequestPriority.Normal,
+    priorities: readonly number[] = DEFAULT_PRIORITIES,
   ) {
     this.maxConcurrent = maxConcurrent;
     this.requestsPerSecond = requestsPerSecond;
@@ -407,6 +436,8 @@ class QueueCore {
     this.batchSize = batchSize;
     this.backupThreshold = backupThreshold;
     this.onQueueDepthWarning = onQueueDepthWarning;
+    this.defaultPriority = defaultPriority;
+    this.priorities = priorities;
   }
 }
 
@@ -474,6 +505,23 @@ export class RequestQueue {
     const batchSize = options.batchSize ?? 10;
     const backupThreshold = options.backupThreshold ?? 50;
     const onQueueDepthWarning = options.onQueueDepthWarning;
+    const defaultPriority = options.defaultPriority ?? RequestPriority.Normal;
+    const priorities = options.priorities ?? DEFAULT_PRIORITIES;
+    if (options.priorities !== undefined) {
+      if (!Array.isArray(options.priorities) || options.priorities.length === 0) {
+        throw new RangeError('priorities must be a non-empty array of numbers');
+      }
+      for (const level of options.priorities) {
+        if (typeof level !== 'number' || !Number.isFinite(level)) {
+          throw new RangeError(`priorities must contain only finite numbers, received ${level}`);
+        }
+      }
+    }
+    if (!priorities.includes(defaultPriority)) {
+      throw new RangeError(
+        `defaultPriority ${defaultPriority} is not one of the configured priorities`,
+      );
+    }
     this.account = options.account;
     if (this.account !== undefined) {
       let core = sharedCores.get(this.account);
@@ -490,6 +538,8 @@ export class RequestQueue {
           batchSize,
           backupThreshold,
           onQueueDepthWarning,
+          defaultPriority,
+          priorities,
         );
         sharedCores.set(this.account, core);
       }
@@ -508,6 +558,8 @@ export class RequestQueue {
         batchSize,
         backupThreshold,
         onQueueDepthWarning,
+        defaultPriority,
+        priorities,
       );
     }
   }
@@ -516,11 +568,18 @@ export class RequestQueue {
     run: () => Promise<T>,
     timeoutMs?: number,
     signal?: AbortSignal,
-    priority: RequestPriority = RequestPriority.Normal,
+    priority: RequestPriority = this.core.defaultPriority,
     method?: string,
   ): Promise<T> {
     if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
       return Promise.reject(new RangeError('timeoutMs must be greater than zero'));
+    }
+    if (!this.core.priorities.includes(priority)) {
+      return Promise.reject(
+        new RangeError(
+          `priority ${priority} is not one of the configured priorities (${this.core.priorities.join(', ')})`,
+        ),
+      );
     }
     if (signal?.aborted) {
       return Promise.reject(signal.reason);
@@ -609,7 +668,7 @@ export class RequestQueue {
     run: () => Promise<T>,
     timeoutMs?: number,
     signal?: AbortSignal,
-    priority: RequestPriority = RequestPriority.Normal,
+    priority: RequestPriority = this.core.defaultPriority,
     method?: string,
   ): Promise<T> {
     const waits = dependencies.map((dep, index) =>
@@ -751,15 +810,19 @@ export class RequestQueue {
    * Selects and removes a request in one synchronous operation. JavaScript runs
    * this to completion before another producer, abort listener, or drain can
    * touch the shared core. Callers use the removal result, not a size check.
+   *
+   * The highest-priority request is selected first; requests sharing that
+   * priority are served in FIFO order (the earliest enqueued wins).
    */
   private dequeue(): PendingRequest<unknown> | undefined {
     const pending = this.core.pending;
     let selectedIndex = -1;
     let selectedPriority = -Infinity;
     for (let i = 0; i < pending.length; i++) {
-      if (pending[i]!.priority > selectedPriority) {
+      const candidate = pending[i]!;
+      if (candidate.priority > selectedPriority) {
         selectedIndex = i;
-        selectedPriority = pending[i]!.priority;
+        selectedPriority = candidate.priority;
       }
     }
     return selectedIndex === -1 ? undefined : pending.splice(selectedIndex, 1)[0];
